@@ -5,8 +5,17 @@ const path = require('path');
 const { createSettingsStore, isSameServer } = require('./config');
 const { installPermissions } = require('./permissions');
 const { installMenu } = require('./menu');
+const updater = require('./updater');
+const discord = require('./discord-rpc');
 
+const APP_NAME = 'Kiyvo';
+const APP_ID = 'world.royakgames.kiyvo';
 const DEFAULT_URL = process.env.KIYVO_URL || 'http://localhost/';
+
+// Make every Electron-facing application label Kiyvo before any windows are created.
+app.setName(APP_NAME);
+if (process.platform === 'win32') app.setAppUserModelId(APP_ID);
+
 const settingsStore = createSettingsStore(app, DEFAULT_URL);
 let mainWindow = null;
 let splashWindow = null;
@@ -25,9 +34,6 @@ function getServerUrl() {
 
 function fitDesktopViewport() {
   if (!mainWindow || mainWindow.isDestroyed()) return;
-  // Kiyvo Desktop now renders at normal Chromium scale, like Chrome/Discord.
-  // The website layout itself handles the available desktop viewport instead
-  // of shrinking the entire renderer and making controls feel tiny or cramped.
   mainWindow.webContents.setZoomFactor(1);
 }
 
@@ -53,6 +59,7 @@ function createSplash() {
     show: false,
     skipTaskbar: true,
     icon: currentIcon(),
+    title: APP_NAME,
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
@@ -79,7 +86,7 @@ function createMainWindow() {
     show: false,
     backgroundColor: '#08090d',
     icon: currentIcon(),
-    title: 'Kiyvo',
+    title: APP_NAME,
     frame: false,
     autoHideMenuBar: true,
     webPreferences: {
@@ -94,14 +101,20 @@ function createMainWindow() {
     }
   });
 
+  // Do not let a webpage title replace the Kiyvo application identity.
+  mainWindow.on('page-title-updated', (event) => {
+    event.preventDefault();
+    mainWindow?.setTitle(APP_NAME);
+  });
+
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    if (isSameServer(url, settings.serverUrl)) return { action: 'allow' };
+    if (isSameServer(url, settingsStore.read().serverUrl)) return { action: 'allow' };
     shell.openExternal(url);
     return { action: 'deny' };
   });
 
   mainWindow.webContents.on('will-navigate', (event, url) => {
-    if (!isSameServer(url, settings.serverUrl)) {
+    if (!isSameServer(url, settingsStore.read().serverUrl)) {
       event.preventDefault();
       shell.openExternal(url);
     }
@@ -117,8 +130,11 @@ function createMainWindow() {
     });
   });
 
-  mainWindow.webContents.on('did-finish-load', () => fitDesktopViewport());
-  mainWindow.on('resize', () => fitDesktopViewport());
+  mainWindow.webContents.on('did-finish-load', () => {
+    fitDesktopViewport();
+    sendUiEvent('window-state', { maximized: mainWindow?.isMaximized() || false });
+  });
+  mainWindow.on('resize', fitDesktopViewport);
 
   mainWindow.webContents.on('render-process-gone', (_event, details) => {
     sendUiEvent('error', {
@@ -141,7 +157,7 @@ function createMainWindow() {
         mainWindow.show();
         mainWindow.focus();
       }
-    }, 1200);
+    }, 900);
   });
 
   const startUrl = settings.openStudioOnLaunch
@@ -161,6 +177,7 @@ function createMainWindow() {
 
 ipcMain.handle('kiyvo:get-environment', () => ({
   desktop: true,
+  appName: APP_NAME,
   platform: process.platform,
   serverUrl: getServerUrl(),
   version: app.getVersion(),
@@ -187,30 +204,37 @@ ipcMain.handle('kiyvo:navigation-state', () => ({
   canGoForward: Boolean(mainWindow?.webContents.canGoForward()),
   maximized: Boolean(mainWindow?.isMaximized())
 }));
-ipcMain.handle('kiyvo:check-updates', async () => ({
-  status: 'current',
-  version: app.getVersion(),
-  title: 'Kiyvo is up to date',
-  message: `You are running Kiyvo Desktop ${app.getVersion()}.`,
-  detail: 'Automatic release updates will appear here when the Kiyvo update channel is connected.'
-}));
+
+ipcMain.handle('kiyvo:check-updates', () => updater.checkForUpdates(app));
+ipcMain.handle('kiyvo:download-update', () => updater.downloadUpdate());
+ipcMain.handle('kiyvo:install-update', () => updater.installUpdate());
+
 ipcMain.handle('kiyvo:open-help', async () => ({
   title: 'Kiyvo Desktop help',
-  message: 'Navigate, create, watch, and broadcast without leaving the app.',
+  message: 'Navigate, create, watch, and broadcast without leaving Kiyvo.',
   items: [
-    'Use Back, Forward, and Reload in the desktop header.',
+    'Use Back, Forward, and Reload in the Kiyvo header.',
     'Open Settings from the gear icon.',
     'Open Creator Studio to upload or start a broadcast.',
     'Press Ctrl + K to search Kiyvo.'
   ]
 }));
-ipcMain.handle('kiyvo:open-external', (_event, url) => shell.openExternal(String(url)));
-ipcMain.handle('kiyvo:settings-read', () => settingsStore.read());
-ipcMain.handle('kiyvo:settings-save', (_event, value) => {
-  const saved = settingsStore.write(value || {});
-  return { ok: true, settings: saved, restartRequired: true };
+ipcMain.handle('kiyvo:open-settings', () => {
+  sendUiEvent('open-settings');
+  return true;
 });
-ipcMain.handle('kiyvo:settings-reset', () => {
+ipcMain.handle('kiyvo:open-external', (_event, url) => shell.openExternal(String(url)));
+
+ipcMain.handle('kiyvo:settings-read', () => settingsStore.read());
+ipcMain.handle('kiyvo:settings-save', async (_event, value) => {
+  const before = settingsStore.read();
+  const saved = settingsStore.write(value || {});
+  if (before.discordRichPresence !== saved.discordRichPresence) {
+    await discord.setEnabled(saved.discordRichPresence, settingsStore);
+  }
+  return { ok: true, settings: saved, restartRequired: before.hardwareAcceleration !== saved.hardwareAcceleration };
+});
+ipcMain.handle('kiyvo:settings-reset', async () => {
   const saved = settingsStore.write({
     serverUrl: DEFAULT_URL,
     startupSound: true,
@@ -219,26 +243,50 @@ ipcMain.handle('kiyvo:settings-reset', () => {
     shareMicrophone: true,
     shareStreamAudio: false,
     monitorVolume: 25,
-    desktopScale: 100
+    desktopScale: 100,
+    theme: 'dark',
+    discordRichPresence: true
   });
+  await discord.setEnabled(true, settingsStore);
   return { ok: true, settings: saved };
 });
+
+ipcMain.handle('kiyvo:discord-activity', (_event, activity) => discord.setActivity(activity || {}));
+ipcMain.handle('kiyvo:discord-enabled', (_event, value) => discord.setEnabled(Boolean(value), settingsStore));
 
 app.commandLine.appendSwitch('enable-features', 'WebRTCPipeWireCapturer');
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
 app.commandLine.appendSwitch('enable-usermedia-screen-capturing');
 if (settingsStore.read().hardwareAcceleration === false) app.disableHardwareAcceleration();
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
+  if (process.platform === 'win32') app.setAppUserModelId(APP_ID);
+  app.setAboutPanelOptions({
+    applicationName: APP_NAME,
+    applicationVersion: app.getVersion(),
+    version: app.getVersion(),
+    copyright: `© ${new Date().getFullYear()} Kiyvo`
+  });
+
   installPermissions(() => mainWindow, 'persist:kiyvo');
-  installMenu({ loadPath, changeServer: () => sendUiEvent('open-settings'), getServerUrl, openSettings: () => sendUiEvent('open-settings') });
+  installMenu({
+    loadPath,
+    changeServer: () => sendUiEvent('open-settings'),
+    getServerUrl,
+    openSettings: () => sendUiEvent('open-settings')
+  });
   createSplash();
   createMainWindow();
+
+  updater.initializeUpdater({ app, getMainWindow: () => mainWindow, emitUiEvent: sendUiEvent });
+  await discord.connect(settingsStore);
+
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createMainWindow();
   });
 });
 
+app.on('before-quit', () => discord.shutdown());
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
 });

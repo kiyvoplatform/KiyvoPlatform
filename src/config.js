@@ -12,7 +12,8 @@ const defaults = (url) => ({
   shareStreamAudio: false,
   monitorVolume: 25,
   desktopScale: 86,
-  theme: 'dark'
+  theme: 'dark',
+  discordRichPresence: true
 });
 
 function normalizeSettings(value, defaultUrl) {

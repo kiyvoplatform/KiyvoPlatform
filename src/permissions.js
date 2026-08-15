@@ -1,6 +1,6 @@
 'use strict';
 
-const { BrowserWindow, desktopCapturer, ipcMain, session } = require('electron');
+const { BrowserWindow, desktopCapturer, ipcMain, session, screen } = require('electron');
 const path = require('path');
 
 let pickerWindow = null;
@@ -37,17 +37,25 @@ async function chooseDesktopSource(mainWindow, sources) {
   installPickerIpc();
 
   pickerSources = sources;
+  const display = mainWindow && !mainWindow.isDestroyed()
+    ? screen.getDisplayMatching(mainWindow.getBounds())
+    : screen.getPrimaryDisplay();
+  const work = display.workAreaSize;
+  const width = Math.max(860, Math.min(work.width - 48, 1480));
+  const height = Math.max(640, Math.min(work.height - 48, 940));
+
   pickerWindow = new BrowserWindow({
-    width: 1000,
-    height: 690,
-    minWidth: 650,
-    minHeight: 480,
+    width,
+    height,
+    minWidth: 760,
+    minHeight: 560,
     parent: mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined,
     modal: Boolean(mainWindow && !mainWindow.isDestroyed()),
     show: false,
     frame: false,
     backgroundColor: '#090a0f',
-    title: 'Share with Kiyvo',
+    title: 'Kiyvo Screen Share',
+    icon: path.join(__dirname, '..', 'assets', process.platform === 'win32' ? 'icon.ico' : 'icon.png'),
     webPreferences: {
       preload: path.join(__dirname, 'share-picker-preload.js'),
       contextIsolation: true,
@@ -100,7 +108,7 @@ function installPermissions(getMainWindow, partition = 'persist:kiyvo') {
       try {
         const sources = await desktopCapturer.getSources({
           types: ['screen', 'window'],
-          thumbnailSize: { width: 640, height: 360 },
+          thumbnailSize: { width: 960, height: 540 },
           fetchWindowIcons: true
         });
         const selected = await chooseDesktopSource(getMainWindow(), sources);
